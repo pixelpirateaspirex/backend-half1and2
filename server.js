@@ -167,8 +167,8 @@ app.use((err, req, res, next) => {
 // ════════════════════════════════════════════════════════════════════════════
 //  START
 // ════════════════════════════════════════════════════════════════════════════
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+const PORT = process.env.PORT || 5000;   // ← ADD THIS LINE
+
 mongoose
   .connect(process.env.MONGODB_URI, {
     serverSelectionTimeoutMS: 10_000,
@@ -176,7 +176,7 @@ mongoose
   })
   .then(() => {
     console.log('✅  MongoDB connected');
-    app.listen(PORT, () => {
+    app.listen(PORT,'0.0.0.0',  () => {
       console.log('');
       console.log('  ⚓  Pixel Pirates Backend');
       console.log(`  🚀  http://localhost:${PORT}`);
