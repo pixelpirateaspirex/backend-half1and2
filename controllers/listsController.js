@@ -12,23 +12,12 @@ const UserData = require('../models/UserData');
 
 /**
  * Fetch or lazily create the UserData document for the authenticated user.
+ * ✅ FIX: changed { user: userId } → { userId } to match the UserData schema
+ *         used consistently in recommendController.js
  */
 async function getUserData(userId) {
-  let doc = await UserData.findOne({ user: userId });
-  if (!doc) {
-    doc = await UserData.create({
-      user: userId,
-      watchlist: [],
-      readingList: [],
-      songsHeard: [],
-      quizPoints: 0,
-      quizHistory: [],
-      quizUnlocked: false,
-      quizAttempted: false,
-      firstQuizAttempt: true,
-    });
-  }
-  return doc;
+  // ✅ UserData.findOrCreate is defined as a static on the model
+  return UserData.findOrCreate(userId);
 }
 
 /** Trim a string field — avoids stored XSS noise */
@@ -38,10 +27,6 @@ function trim(val, max = 500) {
 
 // ─── WATCHLIST ───────────────────────────────────────────────────────────────
 
-/**
- * GET /api/lists/watchlist
- * Returns the full watchlist for the current user.
- */
 exports.getWatchlist = async (req, res) => {
   try {
     const doc = await getUserData(req.user.id);
@@ -52,12 +37,6 @@ exports.getWatchlist = async (req, res) => {
   }
 };
 
-/**
- * POST /api/lists/watchlist
- * Add a movie to the watchlist (idempotent — ignores duplicates by imdbID or title).
- *
- * Body: { imdbID, title, poster, year, genre, rating }
- */
 exports.addToWatchlist = async (req, res) => {
   try {
     const { imdbID, title, poster, year, genre, rating } = req.body;
@@ -68,7 +47,6 @@ exports.addToWatchlist = async (req, res) => {
 
     const doc = await getUserData(req.user.id);
 
-    // Dedup check — match on imdbID when available, else on title
     const isDupe = doc.watchlist.some(
       (m) => (imdbID && m.imdbID === imdbID) || m.title === title
     );
@@ -98,18 +76,11 @@ exports.addToWatchlist = async (req, res) => {
   }
 };
 
-/**
- * PATCH /api/lists/watchlist/:imdbID/watched
- * Toggle the watched flag on a watchlist entry.
- *
- * Body: { watched: boolean }
- */
 exports.toggleWatched = async (req, res) => {
   try {
     const { imdbID } = req.params;
     const doc = await getUserData(req.user.id);
 
-    // Find by imdbID first, then fall back to title param
     const entry = doc.watchlist.find(
       (m) => m.imdbID === imdbID || m._id?.toString() === imdbID
     );
@@ -132,10 +103,6 @@ exports.toggleWatched = async (req, res) => {
   }
 };
 
-/**
- * DELETE /api/lists/watchlist/:imdbID
- * Remove a movie from the watchlist by imdbID or MongoDB _id.
- */
 exports.removeFromWatchlist = async (req, res) => {
   try {
     const { imdbID } = req.params;
@@ -158,13 +125,6 @@ exports.removeFromWatchlist = async (req, res) => {
   }
 };
 
-/**
- * PUT /api/lists/watchlist/sync
- * Bulk-sync the entire watchlist from the client (used on login to merge localStorage → DB).
- * Client sends the full array; server merges deduplicating by imdbID/title.
- *
- * Body: { items: [ ...watchlist entries ] }
- */
 exports.syncWatchlist = async (req, res) => {
   try {
     const { items } = req.body;
@@ -174,7 +134,6 @@ exports.syncWatchlist = async (req, res) => {
 
     const doc = await getUserData(req.user.id);
 
-    // Merge: keep server items, append client items that don't exist on server
     const serverIds = new Set([
       ...doc.watchlist.map((m) => m.imdbID).filter(Boolean),
       ...doc.watchlist.map((m) => m.title),
@@ -195,7 +154,7 @@ exports.syncWatchlist = async (req, res) => {
         watchedAt: m.watchedAt ? new Date(m.watchedAt) : null,
       }));
 
-    doc.watchlist = [...doc.watchlist, ...incoming].slice(0, 500); // cap at 500
+    doc.watchlist = [...doc.watchlist, ...incoming].slice(0, 500);
     await doc.save();
 
     res.json({ success: true, data: doc.watchlist });
@@ -207,9 +166,6 @@ exports.syncWatchlist = async (req, res) => {
 
 // ─── READING LIST ─────────────────────────────────────────────────────────────
 
-/**
- * GET /api/lists/reading
- */
 exports.getReadingList = async (req, res) => {
   try {
     const doc = await getUserData(req.user.id);
@@ -220,10 +176,6 @@ exports.getReadingList = async (req, res) => {
   }
 };
 
-/**
- * POST /api/lists/reading
- * Body: { title, author, cover, genre, bookLink, status }
- */
 exports.addToReadingList = async (req, res) => {
   try {
     const { title, author, cover, genre, bookLink, status } = req.body;
@@ -233,7 +185,6 @@ exports.addToReadingList = async (req, res) => {
     }
 
     const VALID_STATUSES = ['Want to Read', 'Reading', 'Finished'];
-
     const doc = await getUserData(req.user.id);
 
     if (doc.readingList.some((b) => b.title === title)) {
@@ -261,11 +212,6 @@ exports.addToReadingList = async (req, res) => {
   }
 };
 
-/**
- * PATCH /api/lists/reading/:bookId/status
- * Update reading status.
- * Body: { status: 'Want to Read' | 'Reading' | 'Finished' }
- */
 exports.updateReadingStatus = async (req, res) => {
   try {
     const VALID_STATUSES = ['Want to Read', 'Reading', 'Finished'];
@@ -301,9 +247,6 @@ exports.updateReadingStatus = async (req, res) => {
   }
 };
 
-/**
- * DELETE /api/lists/reading/:bookId
- */
 exports.removeFromReadingList = async (req, res) => {
   try {
     const { bookId } = req.params;
@@ -326,11 +269,6 @@ exports.removeFromReadingList = async (req, res) => {
   }
 };
 
-/**
- * PUT /api/lists/reading/sync
- * Bulk sync reading list from client on login.
- * Body: { items: [ ...readingList entries ] }
- */
 exports.syncReadingList = async (req, res) => {
   try {
     const { items } = req.body;
@@ -368,9 +306,6 @@ exports.syncReadingList = async (req, res) => {
 
 // ─── SONGS HEARD ─────────────────────────────────────────────────────────────
 
-/**
- * GET /api/lists/songs
- */
 exports.getSongsHeard = async (req, res) => {
   try {
     const doc = await getUserData(req.user.id);
@@ -381,10 +316,6 @@ exports.getSongsHeard = async (req, res) => {
   }
 };
 
-/**
- * POST /api/lists/songs
- * Body: { trackId, title, artist, album, art, genre, previewUrl }
- */
 exports.addSongHeard = async (req, res) => {
   try {
     const { trackId, title, artist, album, art, genre, previewUrl } = req.body;
@@ -395,14 +326,13 @@ exports.addSongHeard = async (req, res) => {
 
     const doc = await getUserData(req.user.id);
 
-    // Dedup: same trackId or same title+artist combo played within last 10 minutes
     const tenMinAgo = Date.now() - 10 * 60 * 1000;
     const isDupe = doc.songsHeard.some(
       (s) =>
         (trackId && s.trackId === String(trackId)) ||
         (s.title === title &&
           s.artist === artist &&
-          new Date(s.playedAt).getTime() > tenMinAgo)
+          new Date(s.heardAt).getTime() > tenMinAgo)  // ✅ matches schema
     );
     if (isDupe) {
       return res.status(409).json({ success: false, message: 'Song recently logged.' });
@@ -416,11 +346,11 @@ exports.addSongHeard = async (req, res) => {
       art:        trim(art, 500),
       genre:      trim(genre, 100),
       previewUrl: trim(previewUrl, 500),
-      playedAt:   new Date(),
+      heardAt:    new Date(),   // ✅ matches SongHeardSchema field name
     };
 
     doc.songsHeard.unshift(entry);
-    doc.songsHeard = doc.songsHeard.slice(0, 200); // rolling cap
+    doc.songsHeard = doc.songsHeard.slice(0, 200);
     await doc.save();
 
     res.status(201).json({ success: true, data: doc.songsHeard });
@@ -430,9 +360,6 @@ exports.addSongHeard = async (req, res) => {
   }
 };
 
-/**
- * DELETE /api/lists/songs/:songId
- */
 exports.removeSongHeard = async (req, res) => {
   try {
     const { songId } = req.params;
@@ -455,10 +382,6 @@ exports.removeSongHeard = async (req, res) => {
   }
 };
 
-/**
- * PUT /api/lists/songs/sync
- * Body: { items: [ ...songsHeard entries ] }
- */
 exports.syncSongsHeard = async (req, res) => {
   try {
     const { items } = req.body;
@@ -480,11 +403,11 @@ exports.syncSongsHeard = async (req, res) => {
         art:        trim(s.art, 500),
         genre:      trim(s.genre, 100),
         previewUrl: trim(s.previewUrl, 500),
-        playedAt:   s.ts ? new Date(s.ts) : new Date(),
+        heardAt:    s.ts ? new Date(s.ts) : new Date(),  // ✅ matches schema
       }));
 
     doc.songsHeard = [...doc.songsHeard, ...incoming]
-      .sort((a, b) => new Date(b.playedAt) - new Date(a.playedAt))
+      .sort((a, b) => new Date(b.heardAt) - new Date(a.heardAt))  // ✅ sort by heardAt
       .slice(0, 200);
 
     await doc.save();
@@ -495,10 +418,6 @@ exports.syncSongsHeard = async (req, res) => {
   }
 };
 
-/**
- * GET /api/lists/all
- * Returns all three lists in a single round-trip — handy for the login sync.
- */
 exports.getAllLists = async (req, res) => {
   try {
     const doc = await getUserData(req.user.id);
