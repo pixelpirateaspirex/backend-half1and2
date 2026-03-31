@@ -3,8 +3,8 @@
 const axios    = require('axios');
 const UserData = require('../models/UserData');
 
-const PYTHON_URL = process.env.PYTHON_SERVICE_URL || 'http://localhost:5001';
-const OMDB_KEY   = process.env.OMDB_API_KEY || '';   // add OMDB_API_KEY to your .env
+const PYTHON_URL = (process.env.PYTHON_SERVICE_URL || 'http://localhost:5001').replace(/\/$/, '');
+const OMDB_KEY   = process.env.OMDB_API_KEY || '';
 
 // ════════════════════════════════════════════════════════════════════════════
 //  GET /api/preferences  (protected)
@@ -79,7 +79,7 @@ exports.savePreferences = async (req, res) => {
 //  Helper – enrich a single movie with OMDB poster + metadata
 // ════════════════════════════════════════════════════════════════════════════
 async function enrichMovieWithOMDB(movie) {
-  if (!OMDB_KEY) return movie;                         // no key → skip silently
+  if (!OMDB_KEY) return movie;
   const title = movie.title || movie.Title || '';
   if (!title) return movie;
 
@@ -100,7 +100,7 @@ async function enrichMovieWithOMDB(movie) {
       };
     }
   } catch {
-    // OMDB timeout / error – return original movie, poster will show placeholder
+    // OMDB timeout / error – return original movie
   }
   return movie;
 }
@@ -152,13 +152,15 @@ exports.getRecommendations = async (req, res) => {
     }
 
     // ── Call Python service ───────────────────────────────────────────────
+    // FIX: Increased timeout to 30s — Python service downloads models from
+    // Google Drive on cold start which can easily exceed 15s on free tier.
     const { data } = await axios.post(
       `${PYTHON_URL}/recommend/${type}`,
       payload,
-      { timeout: 15_000 }
+      { timeout: 30_000 }
     );
 
-    // ── Enrich movies with OMDB posters (parallel, max 20 concurrent) ─────
+    // ── Enrich movies with OMDB posters (parallel) ────────────────────────
     if (type === 'movies' && Array.isArray(data.recommendations)) {
       data.recommendations = await Promise.all(
         data.recommendations.map((movie) => enrichMovieWithOMDB(movie))
@@ -166,13 +168,37 @@ exports.getRecommendations = async (req, res) => {
     }
 
     res.json(data);
+
   } catch (err) {
+
+    // ── FIX: Python service not running / wrong PYTHON_SERVICE_URL env var ─
     if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+      console.error(`[recommend] Python service unreachable at ${PYTHON_URL}. Set PYTHON_SERVICE_URL env var.`);
       return res.status(503).json({
         success: false,
         message: 'Recommendation service is temporarily unavailable. Please try again later.',
       });
     }
+
+    // ── FIX: Python service timed out (cold start / model download too slow) ─
+    if (err.code === 'ECONNABORTED' || err.message?.includes('timeout')) {
+      console.error(`[recommend] Python service timed out at ${PYTHON_URL}. Cold start may still be in progress.`);
+      return res.status(503).json({
+        success: false,
+        message: 'Recommendation service is waking up. Please retry in 30 seconds.',
+      });
+    }
+
+    // ── FIX: Python service returned a non-2xx HTTP error (e.g. its own 503) ─
+    if (err.response) {
+      console.error(`[recommend] Python service returned ${err.response.status}:`, err.response.data);
+      return res.status(err.response.status).json({
+        success: false,
+        message: err.response.data?.error || err.response.data?.message || 'Recommendation service error.',
+      });
+    }
+
+    // ── Unexpected error ──────────────────────────────────────────────────
     console.error('getRecommendations error:', err.message);
     res.status(500).json({ success: false, message: err.message });
   }
