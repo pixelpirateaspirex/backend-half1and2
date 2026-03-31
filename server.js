@@ -191,13 +191,18 @@ mongoose
     process.exit(1);
   });
 
-const shutdown = (signal) => {
+const shutdown = async (signal) => {
   console.log(`\n${signal} received — shutting down gracefully…`);
-  mongoose.connection.close(() => {
+  try {
+    await mongoose.connection.close();   // ✅ Promise-based, no callback
     console.log('MongoDB connection closed.');
+  } catch (err) {
+    console.error('Error closing MongoDB connection:', err.message);
+  } finally {
     process.exit(0);
-  });
+  }
 };
+
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
 
