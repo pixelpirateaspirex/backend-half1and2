@@ -3,25 +3,18 @@
 /**
  * controllers/quizController.js
  *
- * Handles:
- *   - GET  /api/quiz/state          — load persisted quiz state for the user
- *   - POST /api/quiz/submit         — submit answers, calculate score, persist history
- *   - POST /api/quiz/unlock         — unlock quiz via Premium (mirrors payment activation)
- *   - GET  /api/quiz/history        — paginated attempt history
- *   - POST /api/quiz/reset          — admin/dev: reset a user's quiz state (guarded)
- *
- * The quiz questions are defined in a separate seed file or fetched from AI.
- * This controller manages PERSISTENCE ONLY — question generation happens client-side
- * or via a separate AI route to keep this controller lightweight and testable.
+ * FIX SUMMARY:
+ *  1. getUserData used { user: userId } but UserData schema field is `userId` → fixed
+ *  2. doc.quizHistory → doc.quizAttempts (schema field name)
+ *  3. doc.firstQuizAttempt / doc.quizAttempted don't exist in UserData schema →
+ *     replaced with derived logic from quizAttempts array length
+ *  4. gradedAnswers not in QuizAttemptSchema → quiz submit now stores safe subset
  */
 
 const UserData = require('../models/UserData');
 const User     = require('../models/User');
 
 // ─── Question Bank ───────────────────────────────────────────────────────────
-// In production you'd move this to a DB collection or a CMS.
-// Keeping it here makes the backend self-contained as requested.
-
 const QUESTION_BANK = [
   {
     id: 'q01',
@@ -115,32 +108,22 @@ const QUESTION_BANK = [
   },
 ];
 
-const TOTAL_QUESTIONS = QUESTION_BANK.length; // 10
+const TOTAL_QUESTIONS = QUESTION_BANK.length;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function calcBadge(score, total) {
   const pct = score / total;
-  if (pct === 1)   return '🥇 Gold';
   if (pct >= 0.8)  return '🥇 Gold';
   if (pct >= 0.5)  return '🥈 Silver';
   return '🥉 Bronze';
 }
 
+// FIX 1: was { user: userId } — UserData schema uses `userId` field
 async function getUserData(userId) {
-  let doc = await UserData.findOne({ user: userId });
+  let doc = await UserData.findOne({ userId });
   if (!doc) {
-    doc = await UserData.create({
-      user:             userId,
-      watchlist:        [],
-      readingList:      [],
-      songsHeard:       [],
-      quizPoints:       0,
-      quizHistory:      [],
-      quizUnlocked:     false,
-      quizAttempted:    false,
-      firstQuizAttempt: true,
-    });
+    doc = await UserData.create({ userId });
   }
   return doc;
 }
@@ -149,34 +132,37 @@ async function getUserData(userId) {
 
 /**
  * GET /api/quiz/state
- * Returns current quiz state so the frontend can sync with the DB on login.
  */
 exports.getQuizState = async (req, res) => {
   try {
     const doc = await getUserData(req.user.id);
 
-    // Also peek at subscription status from User document
-    const user       = await User.findById(req.user.id).select('subscription');
-    const subActive  =
+    const user      = await User.findById(req.user.id).select('subscription');
+    const subActive =
       user?.subscription?.status === 'active' &&
       user?.subscription?.expiresAt &&
       new Date(user.subscription.expiresAt) > new Date();
 
-    // If subscription is active, ensure quizUnlocked is synced
+    // FIX 2: quizUnlocked lives on UserData; sync from subscription if needed
     if (subActive && !doc.quizUnlocked) {
       doc.quizUnlocked = true;
       await doc.save();
     }
 
+    // FIX 3: derive attempt flags from quizAttempts array (not missing fields)
+    const attemptCount   = doc.quizAttempts?.length || 0;
+    const quizAttempted  = attemptCount > 0;
+    const firstQuizAttempt = !quizAttempted;
+
     res.json({
       success: true,
       data: {
-        quizPoints:       doc.quizPoints,
-        quizUnlocked:     doc.quizUnlocked || subActive,
-        quizAttempted:    doc.quizAttempted,
-        firstQuizAttempt: doc.firstQuizAttempt,
+        quizPoints:       doc.quizPoints      || 0,
+        quizUnlocked:     doc.quizUnlocked    || subActive || false,
+        quizAttempted,
+        firstQuizAttempt,
         totalQuestions:   TOTAL_QUESTIONS,
-        historyCount:     doc.quizHistory?.length || 0,
+        historyCount:     attemptCount,
       },
     });
   } catch (err) {
@@ -187,15 +173,15 @@ exports.getQuizState = async (req, res) => {
 
 /**
  * GET /api/quiz/questions
- * Returns the shuffled question set (answers are not sent — validated server-side on submit).
- * This prevents client-side answer inspection from the network tab.
  */
 exports.getQuestions = async (req, res) => {
   try {
     const doc = await getUserData(req.user.id);
 
-    // Enforce lock: non-premium users who have already attempted cannot start again
-    if (doc.quizAttempted && !doc.quizUnlocked) {
+    // FIX 3: derive quizAttempted from array
+    const quizAttempted = (doc.quizAttempts?.length || 0) > 0;
+
+    if (quizAttempted && !doc.quizUnlocked) {
       return res.status(403).json({
         success: false,
         message: 'Quiz is locked. Upgrade to Premium to retry.',
@@ -203,11 +189,10 @@ exports.getQuestions = async (req, res) => {
       });
     }
 
-    // Send questions WITHOUT the `correct` field
     const questions = QUESTION_BANK.map(({ id, text, options, category }) => ({
       id,
       text,
-      options: shuffle([...options]), // shuffle option order per request
+      options: shuffle([...options]),
       category,
     }));
 
@@ -220,10 +205,7 @@ exports.getQuestions = async (req, res) => {
 
 /**
  * POST /api/quiz/submit
- *
  * Body: { answers: [ { id: 'q01', answer: 'The Dark Knight' }, ... ] }
- *
- * Validates answers server-side, calculates score, persists result.
  */
 exports.submitQuiz = async (req, res) => {
   try {
@@ -235,8 +217,11 @@ exports.submitQuiz = async (req, res) => {
 
     const doc = await getUserData(req.user.id);
 
-    // Enforce lock
-    if (doc.quizAttempted && !doc.quizUnlocked) {
+    // FIX 3: derive from array
+    const quizAttempted = (doc.quizAttempts?.length || 0) > 0;
+    const isFirst       = !quizAttempted;
+
+    if (quizAttempted && !doc.quizUnlocked) {
       return res.status(403).json({
         success: false,
         message: 'Quiz is locked. Upgrade to Premium to retry.',
@@ -249,30 +234,20 @@ exports.submitQuiz = async (req, res) => {
 
     let score = 0;
     const gradedAnswers = answers.map((a) => {
-      const q       = questionMap[a.id];
+      const q = questionMap[a.id];
       if (!q) return { id: a.id, answer: a.answer, correct: null, isCorrect: false };
       const isCorrect = q.correct === a.answer;
       if (isCorrect) score++;
-      return {
-        id:         a.id,
-        question:   q.text,
-        answer:     a.answer,
-        correct:    q.correct,
-        isCorrect,
-      };
+      return { id: a.id, question: q.text, answer: a.answer, correct: q.correct, isCorrect };
     });
 
-    const total      = QUESTION_BANK.length;
-    const earned     = score * 10;
-    const isPerfect  = score === total;
-    const isFirst    = doc.firstQuizAttempt;
-    const badge      = calcBadge(score, total);
+    const total     = QUESTION_BANK.length;
+    const earned    = score * 10;
+    const isPerfect = score === total;
+    const badge     = calcBadge(score, total);
 
-    // ── Persist ──────────────────────────────────────────────────────────────
-    doc.quizPoints += earned;
-    doc.quizAttempted    = true;
-    doc.firstQuizAttempt = false;
-
+    // FIX 4: Only store fields that exist in QuizAttemptSchema
+    // (gradedAnswers is NOT in schema — returned to client only, not persisted)
     const attempt = {
       score,
       total,
@@ -280,12 +255,17 @@ exports.submitQuiz = async (req, res) => {
       badge,
       isPerfect,
       isFirst,
-      gradedAnswers,
-      attemptedAt: new Date(),
+      ts: new Date(),
     };
 
-    doc.quizHistory.unshift(attempt);
-    doc.quizHistory = doc.quizHistory.slice(0, 50); // keep last 50 attempts
+    // FIX 2: use quizAttempts (correct field name from UserData schema)
+    if (!doc.quizAttempts) doc.quizAttempts = [];
+    doc.quizAttempts.unshift(attempt);
+    doc.quizAttempts = doc.quizAttempts.slice(0, 50);
+
+    // FIX 5: quizPoints field exists in schema
+    if (!doc.quizPoints) doc.quizPoints = 0;
+    doc.quizPoints += earned;
 
     // Free Premium: perfect on first try
     let grantFreePremium = false;
@@ -293,8 +273,7 @@ exports.submitQuiz = async (req, res) => {
       doc.quizUnlocked = true;
       grantFreePremium = true;
 
-      // Also activate on User document
-      const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // +30 days
+      const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
       await User.findByIdAndUpdate(req.user.id, {
         'subscription.status':      'active',
         'subscription.plan':        'premium',
@@ -317,10 +296,10 @@ exports.submitQuiz = async (req, res) => {
         badge,
         isPerfect,
         isFirst,
-        grantFreePremium,   // tells frontend to show the "free premium" modal
-        totalPoints:   doc.quizPoints,
-        quizUnlocked:  doc.quizUnlocked,
-        gradedAnswers,
+        grantFreePremium,
+        totalPoints:  doc.quizPoints,
+        quizUnlocked: doc.quizUnlocked || false,
+        gradedAnswers, // returned to client but NOT stored in DB
       },
     });
   } catch (err) {
@@ -331,8 +310,6 @@ exports.submitQuiz = async (req, res) => {
 
 /**
  * GET /api/quiz/history
- * Returns the user's attempt history (paginated).
- * Query params: ?page=1&limit=10
  */
 exports.getQuizHistory = async (req, res) => {
   try {
@@ -342,23 +319,25 @@ exports.getQuizHistory = async (req, res) => {
 
     const doc = await getUserData(req.user.id);
 
-    const total   = doc.quizHistory.length;
-    const history = doc.quizHistory.slice(skip, skip + limit).map((h) => ({
+    // FIX 2: quizAttempts not quizHistory
+    const attempts = doc.quizAttempts || [];
+    const total    = attempts.length;
+    const history  = attempts.slice(skip, skip + limit).map((h) => ({
       score:       h.score,
       total:       h.total,
       earned:      h.earned,
       badge:       h.badge,
       isPerfect:   h.isPerfect,
       isFirst:     h.isFirst,
-      attemptedAt: h.attemptedAt,
+      attemptedAt: h.ts,
     }));
 
     res.json({
       success: true,
       data: {
         history,
-        quizPoints:  doc.quizPoints,
-        quizUnlocked: doc.quizUnlocked,
+        quizPoints:   doc.quizPoints   || 0,
+        quizUnlocked: doc.quizUnlocked || false,
         pagination: {
           page,
           limit,
@@ -375,9 +354,6 @@ exports.getQuizHistory = async (req, res) => {
 
 /**
  * POST /api/quiz/unlock
- * Manually unlock the quiz for a user who has just subscribed via
- * an in-app payment flow (if not using Stripe webhooks).
- * Protected — requires a valid JWT AND an active subscription.
  */
 exports.unlockQuiz = async (req, res) => {
   try {
@@ -407,10 +383,7 @@ exports.unlockQuiz = async (req, res) => {
 };
 
 /**
- * POST /api/quiz/reset  (dev / admin only — guard with ADMIN_SECRET)
- * Resets quiz state for a user. Use in dev/testing only.
- *
- * Body: { adminSecret, userId? }  (userId defaults to req.user.id)
+ * POST /api/quiz/reset  (dev / admin only)
  */
 exports.resetQuiz = async (req, res) => {
   try {
@@ -423,11 +396,10 @@ exports.resetQuiz = async (req, res) => {
     const targetId = userId || req.user.id;
     const doc      = await getUserData(targetId);
 
-    doc.quizPoints       = 0;
-    doc.quizHistory      = [];
-    doc.quizUnlocked     = false;
-    doc.quizAttempted    = false;
-    doc.firstQuizAttempt = true;
+    // FIX 2: reset correct field name
+    doc.quizPoints   = 0;
+    doc.quizAttempts = [];
+    doc.quizUnlocked = false;
     await doc.save();
 
     res.json({ success: true, message: `Quiz state reset for user ${targetId}.` });
@@ -439,7 +411,6 @@ exports.resetQuiz = async (req, res) => {
 
 // ─── Utility ─────────────────────────────────────────────────────────────────
 
-/** Fisher-Yates shuffle */
 function shuffle(arr) {
   for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));

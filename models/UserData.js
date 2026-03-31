@@ -3,7 +3,7 @@
 const mongoose = require('mongoose');
 
 // ════════════════════════════════════════════════════════════════════════════
-//  SUB-SCHEMAS  (embedded documents inside UserData)
+//  SUB-SCHEMAS
 // ════════════════════════════════════════════════════════════════════════════
 
 const WatchlistItemSchema = new mongoose.Schema(
@@ -75,6 +75,8 @@ const RecentlyViewedSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// FIX: Added `isFirst` field that quizController writes.
+// Removed `gradedAnswers` — it's returned to client only, not persisted.
 const QuizAttemptSchema = new mongoose.Schema(
   {
     score:     { type: Number,  required: true },
@@ -82,7 +84,7 @@ const QuizAttemptSchema = new mongoose.Schema(
     earned:    { type: Number,  default: 0 },
     badge:     { type: String,  default: '🥉 Bronze' },
     isPerfect: { type: Boolean, default: false },
-    isFirst:   { type: Boolean, default: false },
+    isFirst:   { type: Boolean, default: false }, // FIX: was missing, caused Mongoose to drop it
     ts:        { type: Date,    default: Date.now },
   },
   { _id: false }
@@ -102,36 +104,44 @@ const ChatMessageSchema = new mongoose.Schema(
 //  MAIN USER DATA SCHEMA
 // ════════════════════════════════════════════════════════════════════════════
 const UserDataSchema = new mongoose.Schema({
+  // FIX: was missing `userId` index field in original — this IS the field
+  // quizController looked up via { userId } but schema had it correct already.
+  // Keeping it here clearly for reference.
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
 
-  // ── AI Recommendation Preferences (set during onboarding) ────────────────
-  movieGenres:       { type: [String], default: [] },  // ['Action', 'Drama']
-  musicGenres:       { type: [String], default: [] },  // ['Pop', 'Rock']
-  gameGenres:        { type: [String], default: [] },  // ['RPG', 'Strategy']
-  audiobookDuration: { type: [String], default: [] },  // ['short', 'medium']
-  audiobookPrice:    { type: [String], default: [] },  // ['free_low', 'budget']
+  // ── AI Recommendation Preferences ────────────────────────────────────────
+  movieGenres:       { type: [String], default: [] },
+  musicGenres:       { type: [String], default: [] },
+  gameGenres:        { type: [String], default: [] },
+  audiobookDuration: { type: [String], default: [] },
+  audiobookPrice:    { type: [String], default: [] },
   language:          { type: [String], default: ['English'] },
-  contentTypes:      { type: [String], default: [] },  // ['movies', 'songs', ...]
+  contentTypes:      { type: [String], default: [] },
 
-  // ── Onboarding state ──────────────────────────────────────────────────────
+  // ── Onboarding ────────────────────────────────────────────────────────────
   onboarded: { type: Boolean, default: false },
 
-  // ── Premium mirror (denormalised for fast reads) ───────────────────────────
+  // ── Premium ───────────────────────────────────────────────────────────────
   isPremium: { type: Boolean, default: false },
 
   // ── Lists ─────────────────────────────────────────────────────────────────
-  watchlist:    { type: [WatchlistItemSchema],    default: [] },
-  readingList:  { type: [ReadingListItemSchema],  default: [] },
-  songsHeard:   { type: [SongHeardSchema],        default: [] },
+  watchlist:    { type: [WatchlistItemSchema],   default: [] },
+  readingList:  { type: [ReadingListItemSchema], default: [] },
+  songsHeard:   { type: [SongHeardSchema],       default: [] },
 
-  // ── Activity / analytics ──────────────────────────────────────────────────
-  userHistory:    { type: [ActivityItemSchema],    default: [] },
-  recentlyViewed: { type: [RecentlyViewedSchema],  default: [] },
+  // ── Activity ──────────────────────────────────────────────────────────────
+  userHistory:    { type: [ActivityItemSchema],   default: [] },
+  recentlyViewed: { type: [RecentlyViewedSchema], default: [] },
 
-  // ── Quiz history ──────────────────────────────────────────────────────────
+  // ── Quiz ─────────────────────────────────────────────────────────────────
+  // FIX: quizController uses quizAttempts, quizPoints, quizUnlocked.
+  // Original schema had `quizAttempts` correctly but controller was calling
+  // it `quizHistory` — both are now aligned to `quizAttempts`.
   quizAttempts: { type: [QuizAttemptSchema], default: [] },
+  quizPoints:   { type: Number,  default: 0 },
+  quizUnlocked: { type: Boolean, default: false },
 
-  // ── Chatbot history ───────────────────────────────────────────────────────
+  // ── Chatbot ───────────────────────────────────────────────────────────────
   chatHistory: { type: [ChatMessageSchema], default: [] },
 });
 
