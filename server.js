@@ -22,6 +22,15 @@ if (missing.length) {
 const app = express();
 
 // ════════════════════════════════════════════════════════════════════════════
+//  FIX 1: Trust Render's reverse proxy so rate-limiters see real client IPs.
+//  Without this, every user shares Render's load-balancer IP → the global
+//  200-req/15-min cap is hit almost instantly across ALL users combined.
+//  Setting trust proxy = 1 tells express-rate-limit to read the real IP
+//  from the X-Forwarded-For header that Render's proxy injects.
+// ════════════════════════════════════════════════════════════════════════════
+app.set('trust proxy', 1);
+
+// ════════════════════════════════════════════════════════════════════════════
 //  STRIPE WEBHOOK — must receive raw body BEFORE express.json() parses it
 // ════════════════════════════════════════════════════════════════════════════
 app.use('/api/payment/webhook', express.raw({ type: 'application/json' }));
@@ -40,7 +49,7 @@ const allowedOrigins = [
   process.env.CLIENT_URL || 'http://localhost:3000',
   'http://localhost:5173',
   'http://localhost:3001',
-  'https://pixelpirate9555-xi.vercel.app',  // ✅ removed trailing slash
+  'https://pixelpirate9555-xi.vercel.app',
 ];
 
 app.use(
@@ -62,15 +71,19 @@ if (process.env.NODE_ENV !== 'production') app.use(morgan('dev'));
 // ════════════════════════════════════════════════════════════════════════════
 //  RATE LIMITING
 // ════════════════════════════════════════════════════════════════════════════
+
+// Global limiter — raised to 500 so normal browsing doesn't trigger 429.
+// Per-real-IP thanks to trust proxy above.
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 200,
+  max: 500,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, message: 'Too many requests from this IP. Please wait 15 minutes.' },
 });
 app.use('/api', globalLimiter);
 
+// Auth limiter — tight (stays at 15), these should be rare and slow.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 15,
@@ -80,6 +93,24 @@ const authLimiter = rateLimit({
 app.use('/api/auth/login',           authLimiter);
 app.use('/api/auth/register',        authLimiter);
 app.use('/api/auth/forgot-password', authLimiter);
+
+// ════════════════════════════════════════════════════════════════════════════
+//  FIX 2: Dedicated recommend limiter — replaces the global cap for this
+//  route. 4 tabs × reasonable refresh = ~40 req/15 min per user is fine.
+//  The backend-side recommendController cache means repeat tab clicks are
+//  served instantly without touching this limiter at all.
+// ════════════════════════════════════════════════════════════════════════════
+const recommendLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,                          // 60 recommend calls / 15 min / IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many recommendation requests. Please wait a few minutes.',
+    retryAfter: 60,
+  },
+});
 
 // ════════════════════════════════════════════════════════════════════════════
 //  ROUTES
@@ -112,7 +143,9 @@ app.post('/api/preferences', authMiddleware, savePreferences);
 
 // ── AI Recommendations (premium) ─────────────────────────────────────────────
 //  GET /api/recommend/:type  where type = movies | songs | games | audiobooks
-app.get('/api/recommend/:type', authMiddleware, getRecommendations);
+//  recommendLimiter applied BEFORE authMiddleware so bad actors are rejected
+//  before we even touch the DB.
+app.get('/api/recommend/:type', recommendLimiter, authMiddleware, getRecommendations);
 
 // ════════════════════════════════════════════════════════════════════════════
 //  HEALTH CHECK
@@ -168,7 +201,7 @@ app.use((err, req, res, next) => {
 // ════════════════════════════════════════════════════════════════════════════
 //  START
 // ════════════════════════════════════════════════════════════════════════════
-const PORT = process.env.PORT || 5000;   // ← ADD THIS LINE
+const PORT = process.env.PORT || 5000;
 
 mongoose
   .connect(process.env.MONGODB_URI, {
@@ -177,7 +210,7 @@ mongoose
   })
   .then(() => {
     console.log('✅  MongoDB connected');
-    app.listen(PORT,'0.0.0.0',  () => {
+    app.listen(PORT, '0.0.0.0', () => {
       console.log('');
       console.log('  ⚓  Pixel Pirates Backend');
       console.log(`  🚀  http://localhost:${PORT}`);
@@ -194,7 +227,7 @@ mongoose
 const shutdown = async (signal) => {
   console.log(`\n${signal} received — shutting down gracefully…`);
   try {
-    await mongoose.connection.close();   // ✅ Promise-based, no callback
+    await mongoose.connection.close();
     console.log('MongoDB connection closed.');
   } catch (err) {
     console.error('Error closing MongoDB connection:', err.message);
