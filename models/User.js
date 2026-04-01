@@ -28,7 +28,7 @@ const UserSchema = new mongoose.Schema(
     password: {
       type:      String,
       minlength: [6, 'Password must be at least 6 characters'],
-      select:    false, // never returned in queries unless explicitly requested
+      select:    false,
     },
     photoURL: {
       type:    String,
@@ -43,11 +43,12 @@ const UserSchema = new mongoose.Schema(
     },
     googleId: {
       type:    String,
-      sparse:  true, // allows multiple null values in the unique index
+      sparse:  true,
       default: null,
     },
-firebaseUid: { type: String, sparse: true, index: true },
-    // ── Premium / Subscription ────────────────────────────────────────────────
+    firebaseUid: { type: String, sparse: true, index: true },
+
+    // ── Premium / Subscription (legacy flat fields — kept for compatibility) ──
     isPremium: {
       type:    Boolean,
       default: false,
@@ -60,27 +61,40 @@ firebaseUid: { type: String, sparse: true, index: true },
     premiumActivatedAt: { type: Date, default: null },
     premiumExpiresAt:   { type: Date, default: null },
 
-    // ── Stripe identifiers ────────────────────────────────────────────────────
-stripeCustomerId: { type: String, default: null },
-    stripeSubscriptionId: { type: String, default: null },
+    // ── Stripe identifiers (top-level, kept for compatibility) ────────────────
+    stripeCustomerId:    { type: String, default: null },
+    stripeSubscriptionId:{ type: String, default: null },
 
-    // ── Quiz state (persisted on User for fast auth-response reads) ───────────
+    // ── FIX: Subscription subdocument — required by paymentController.js ─────
+    // paymentController reads/writes user.subscription.status, .plan, .stripeSubId
+    // etc. This subdocument keeps all Stripe state in one place.
+    subscription: {
+      status: {
+        type:    String,
+        enum:    ['inactive', 'active', 'past_due', 'cancelled', 'cancelling'],
+        default: 'inactive',
+      },
+      plan:           { type: String, default: 'free' },
+      stripeSubId:    { type: String, default: null },   // Stripe subscription ID
+      stripeSessionId:{ type: String, default: null },   // Stripe checkout session ID
+      stripePriceId:  { type: String, default: null },   // Stripe price ID
+      activatedAt:    { type: Date,   default: null },
+      expiresAt:      { type: Date,   default: null },
+      updatedAt:      { type: Date,   default: null },
+      orderId:        { type: String, default: null },   // e.g. "PP-XXXXXXXXXX"
+    },
+
+    // ── Quiz state ────────────────────────────────────────────────────────────
     quizPoints:       { type: Number,  default: 0 },
     quizAttempted:    { type: Boolean, default: false },
     quizUnlocked:     { type: Boolean, default: false },
     firstQuizAttempt: { type: Boolean, default: true },
 
     // ── Password reset ────────────────────────────────────────────────────────
-    passwordResetToken: {
-      type:   String,
-      select: false, // never exposed in API responses
-    },
-    passwordResetExpires: {
-      type:   Date,
-      select: false,
-    },
+    passwordResetToken:   { type: String, select: false },
+    passwordResetExpires: { type: Date,   select: false },
 
-    // ── Email verification (ready for future use) ─────────────────────────────
+    // ── Email verification ────────────────────────────────────────────────────
     isEmailVerified:        { type: Boolean, default: false },
     emailVerificationToken: { type: String,  select: false },
 
@@ -89,9 +103,7 @@ stripeCustomerId: { type: String, default: null },
     lastLogin: { type: Date,    default: null },
   },
   {
-    timestamps: true, // adds createdAt + updatedAt automatically
-
-    // Strip sensitive fields when converting to JSON (e.g. res.json(user))
+    timestamps: true,
     toJSON: {
       virtuals: true,
       transform(_doc, ret) {
@@ -110,17 +122,14 @@ stripeCustomerId: { type: String, default: null },
 //  INDEXES
 // ════════════════════════════════════════════════════════════════════════════
 UserSchema.index({ email: 1 });
-UserSchema.index({ googleId: 1 },          { sparse: true });
+UserSchema.index({ googleId: 1 }, { sparse: true });
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PRE-SAVE HOOK — Hash password before saving
+//  PRE-SAVE HOOK
 // ════════════════════════════════════════════════════════════════════════════
 UserSchema.pre('save', async function (next) {
-  // Only hash if password field was actually changed
   if (!this.isModified('password') || !this.password) return next();
-
   try {
-    // Cost factor 12 — good balance of security vs speed (~250ms on modern hardware)
     this.password = await bcrypt.hash(this.password, 12);
     next();
   } catch (err) {
@@ -131,57 +140,55 @@ UserSchema.pre('save', async function (next) {
 // ════════════════════════════════════════════════════════════════════════════
 //  INSTANCE METHODS
 // ════════════════════════════════════════════════════════════════════════════
-
-/**
- * Compare a plain-text candidate with the stored hash.
- * Returns true if they match, false otherwise.
- */
 UserSchema.methods.comparePassword = async function (candidate) {
   if (!this.password) return false;
   return bcrypt.compare(candidate, this.password);
 };
 
-/**
- * Generate a plain reset token, store its SHA-256 hash in the DB,
- * and return the plain token (to be sent via email).
- * Token expires in 10 minutes.
- */
 UserSchema.methods.createPasswordResetToken = function () {
-  // 32 random bytes → 64-char hex string
   const plainToken = crypto.randomBytes(32).toString('hex');
-
-  // Hash before storing (so a DB leak can't be used to reset passwords)
   this.passwordResetToken = crypto
     .createHash('sha256')
     .update(plainToken)
     .digest('hex');
-
-  this.passwordResetExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
-
-  return plainToken; // caller embeds this in the email link
+  this.passwordResetExpires = Date.now() + 10 * 60 * 1000;
+  return plainToken;
 };
 
 /**
- * Activate premium subscription.
- * type: 'monthly' | 'free_earned'
- * Both grant 30 days of premium access.
+ * activatePremium — updates BOTH the legacy flat fields AND the new
+ * subscription subdocument so both stay in sync.
  */
 UserSchema.methods.activatePremium = function (type = 'monthly') {
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+  // Legacy fields (kept for any existing code that reads them)
   this.isPremium          = true;
   this.premiumType        = type;
   this.premiumActivatedAt = new Date();
-  this.premiumExpiresAt   = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  this.premiumExpiresAt   = expiresAt;
   this.quizUnlocked       = true;
+
+  // New subscription subdocument
+  this.subscription.status      = 'active';
+  this.subscription.plan        = 'premium';
+  this.subscription.activatedAt = new Date();
+  this.subscription.expiresAt   = expiresAt;
+  this.subscription.updatedAt   = new Date();
 };
 
 /**
- * Deactivate premium (called from Stripe webhook on subscription cancellation).
+ * deactivatePremium — updates both legacy fields and subscription subdocument.
  */
 UserSchema.methods.deactivatePremium = function () {
-  this.isPremium     = false;
-  this.premiumType   = 'none';
-  this.quizUnlocked  = false;
-  // Keep premiumExpiresAt as a record
+  // Legacy fields
+  this.isPremium    = false;
+  this.premiumType  = 'none';
+  this.quizUnlocked = false;
+
+  // Subscription subdocument
+  this.subscription.status    = 'cancelled';
+  this.subscription.updatedAt = new Date();
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -189,12 +196,21 @@ UserSchema.methods.deactivatePremium = function () {
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
- * isPremiumActive — true if premium is set AND not yet expired.
+ * isPremiumActive — true if subscription is active AND not expired.
+ * Checks the subscription subdocument first, falls back to legacy fields.
  */
 UserSchema.virtual('isPremiumActive').get(function () {
+  const now = new Date();
+
+  // Check new subscription subdocument first
+  if (this.subscription?.status === 'active' && this.subscription?.expiresAt) {
+    return now < new Date(this.subscription.expiresAt);
+  }
+
+  // Fallback to legacy fields
   if (!this.isPremium) return false;
-  if (!this.premiumExpiresAt) return true; // no expiry = lifetime
-  return new Date() < this.premiumExpiresAt;
+  if (!this.premiumExpiresAt) return true;
+  return now < this.premiumExpiresAt;
 });
 
 // ════════════════════════════════════════════════════════════════════════════
